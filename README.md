@@ -1,6 +1,6 @@
 # SteelDivision2-monitor
-1.直接在终端输入命令反馈rcon指令  
- Enter the command feedback rcon command directly in the terminal  
+1.直接在终端输入rcon命令并反馈
+ Enter the rcon command directly in the terminal and get feedback
  command extra:  
  +quit  
  +version  
