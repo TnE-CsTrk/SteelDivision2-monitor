@@ -3,7 +3,7 @@
  Enter the command feedback rcon command directly in the terminal  
  command extra:  
  +quit  
- version  
+ +version  
  +status  shouw player status  
 2.对接API(聊天机器人)  
 Connect to chatbot API  
