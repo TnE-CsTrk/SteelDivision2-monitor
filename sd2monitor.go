@@ -6,11 +6,14 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"github.com/fsnotify/fsnotify"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -30,11 +33,11 @@ var (
 )
 
 var (
-  // ！！！！！！！！！！rcon参数配置
 	ipstr        = "127.0.0.1"    // 静态IP
-	portnum      = "7890"         // 静态端口
+	portnum      = "27234"        // 静态端口
 	rconpassword = "yourpassword" // 静态密码
 	chatfile     = "chat.txt"
+	deckfile     = "deck.txt"
 	usebot       = false
 	modeonly     = true
 )
@@ -50,9 +53,18 @@ type Player struct {
 	PlayerIALevel     int
 }
 
+type DeckEntry struct {
+	EugNetID          string
+	PlayerName        string
+	SteamID           string
+	PlayerDeckContent string
+	Remark            string // 新增字段，用于存储备注信息
+}
+
 // 使用包级别的变量和互斥锁来管理玩家集合
 var (
 	players      = make(map[string]*Player) // 使用map来存储玩家信息，key为EugNetID
+	deckContents [20]DeckEntry              // 存储玩家的 PlayerDeckContent 及相关信息
 	mutex        sync.Mutex
 	serverName   string
 	mapName      string
@@ -60,8 +72,8 @@ var (
 )
 
 var validAPIKeys = map[string]bool{
-	"p*L*CGwa85hNk)etW^nkfjckos730X": true,
-	// /！！！！！！！！！！修改成你的apikey/！！！！！！！！！！
+	"p*L*CGwa85hNk)etW^&LWvJ^eqHp>V": true,
+	// Add more API keys as needed
 }
 
 func main() {
@@ -94,6 +106,23 @@ func main() {
 		}
 	}
 
+	// 从自定义文件中加载 DeckEntry 数据
+	err = loadDeckEntriesFromCustomFile(deckfile)
+	if err != nil {
+		fmt.Printf("加载文件时出错: %v\n", err)
+		return
+	}
+
+	// 输出 deckContents 的内容
+	fmt.Println("=== 当前的 Deck Contents ===")
+	for i, deck := range deckContents {
+		if deck.PlayerName == "" {
+			fmt.Printf("槽位 %d: null\n", i+1)
+		} else {
+			fmt.Printf("槽位 %d: %+v\n", i+1, deck)
+		}
+	}
+
 	// 检查扫描是否有错误
 	if err := scannerf.Err(); err != nil {
 		fmt.Println("Error reading file:", err)
@@ -106,8 +135,19 @@ func main() {
 	//chatpath := "settings/" + chatfile
 	go func() {
 		http.HandleFunc("/status", handleStatus)
-		http.HandleFunc("/func", handleFunc)          //
-		log.Fatal(http.ListenAndServe(":27291", nil)) //！！！！！！！！！！修改为你的api端口/！！！！！！！！！！
+		http.HandleFunc("/func", handleFunc) //
+		http.HandleFunc("/deck", handleCode)
+		log.Fatal(http.ListenAndServe(":28323", nil)) //你的api端口
+	}()
+
+	// 主线程从通道中接收数据并处理
+	go func() {
+		lineChan := make(chan string)
+		// 启动一个新的 goroutine，传入通道
+		go monitorFile(filepath.Join("settings", "chat.txt"), lineChan)
+		// 启动处理通道数据的 goroutine
+		go processChatLines(lineChan)
+
 	}()
 
 	cmd := exec.Command("sh", "-c", "./entrypoint.sh")
@@ -148,6 +188,7 @@ func main() {
 		if matches := reNbIA.FindStringSubmatch(line); len(matches) > 1 {
 			nbIA, _ = strconv.Atoi(matches[1])
 		}
+
 		if usebot {
 
 			if nbPlayersAndIA > 0 {
@@ -207,7 +248,7 @@ func main() {
 
 				if len(aibluePlayers) == 2 {
 					var kickbot = "kick " + aibluePlayers[1]
-					var changebotname = "setpvar " + aibluePlayers[1] + " PlayerName yourbotname"
+					var changebotname = "setpvar " + aibluePlayers[1] + " PlayerName [discord]erJgTT9pWs(reportTK &unBan)"
 					if len(redPlayers) == 10 {
 						sendMessage(kickbot, sharedConn)
 						aibluePlayers = aibluePlayers[:1]
@@ -224,7 +265,7 @@ func main() {
 					}
 				} else if len(airedPlayers) == 2 {
 					var kickbot = "kick " + airedPlayers[1]
-					var changebotname = "setpvar " + airedPlayers[1] + " PlayerName yourbotname"
+					var changebotname = "setpvar " + airedPlayers[1] + " PlayerName [Q群]429073856(autoFullKickBOT)"
 					if len(bluePlayers) == 10 {
 						sendMessage(kickbot, sharedConn)
 						airedPlayers = airedPlayers[:1]
@@ -259,6 +300,28 @@ func main() {
 					IPAddress: strings.Split(match[2], ":")[0], // 只取IP，不要端口
 				}
 				players[match[1]] = player
+			}
+
+			//
+			// 计数 PlayerAlliance 为 "1" 和 "0" 的玩家数量
+			allianceRedCount := 0
+			allianceBlueCount := 0
+
+			// 遍历 map
+			for _, player := range players {
+				if player.PlayerAlliance == "1" {
+					allianceBlueCount++
+				} else if player.PlayerAlliance == "0" {
+					allianceRedCount++
+				}
+			}
+			// 判断并输出结果
+			if allianceRedCount > allianceBlueCount {
+				players[match[1]].PlayerAlliance = "1"
+				fmt.Printf("!!!WARNING!!! 设置玩家al为1blue red: %d blue: %d\n", allianceRedCount, allianceBlueCount)
+			} else {
+				players[match[1]].PlayerAlliance = "0"
+				fmt.Printf("!!!WARNING!!! 设置玩家al为0red red: %d blue: %d\n", allianceRedCount, allianceBlueCount)
 			}
 		}
 
@@ -440,8 +503,28 @@ func rconcontorl() {
 				fmt.Printf("#%d %s %s %s %s\n Deck: %s\n", index+1, player.PlayerName, player.EugNetID, player.SteamID, player.IPAddress, player.PlayerDeckContent)
 			}
 			continue
+		case "deck":
+			fmt.Println("\n=== 所有位置的玩家卡组信息 ===")
+			for i, deck := range deckContents {
+				position := i + 1
+				if deck.PlayerDeckContent == "" {
+					fmt.Printf("位置 %d: null\n", position)
+				} else {
+					fmt.Printf("位置 %d:\n", position)
+					fmt.Printf("  EugNetID: %s\n", deck.EugNetID)
+					fmt.Printf("  PlayerName: %s\n", deck.PlayerName)
+					fmt.Printf("  SteamID: %s\n", deck.SteamID)
+					fmt.Printf("  PlayerDeckContent: %s\n", deck.PlayerDeckContent)
+					if deck.Remark != "" {
+						fmt.Printf("  Remark: %s\n", deck.Remark)
+					} else {
+						fmt.Printf("  Remark: null\n")
+					}
+				}
+			}
+			continue
 		case "version":
-			fmt.Println("Steel Division 2 monitor Version 1.03 ")
+			fmt.Println("Steel Division 2 monitor Version 1.10 ")
 			continue
 		}
 
@@ -561,6 +644,52 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Set Content-Type header and write JSON response
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(jsonResponse)
+}
+
+func handleCode(w http.ResponseWriter, r *http.Request) {
+	// 获取apikey参数
+	apiKey := r.Header.Get("apikey")
+	// 检查apikey的有效性
+	if !validAPIKeys[apiKey] {
+		http.Error(w, "Invalid API Key", http.StatusUnauthorized)
+		return
+	}
+
+	// 按照数组顺序获取 DeckEntry，并加上编号 (index + 1)
+	var sortedDeckEntries []interface{}
+	for i, entry := range deckContents {
+		// 检查数组中的零值，通过判断 EugNetID 是否为空
+		if entry.EugNetID != "" {
+			// 如果插槽不为空，则包括实际数据和 index
+			sortedDeckEntries = append(sortedDeckEntries, map[string]interface{}{
+				"index":               i + 1, // 显示第几个
+				"eug_net_id":          entry.EugNetID,
+				"player_name":         entry.PlayerName,
+				"steam_id":            entry.SteamID,
+				"player_deck_content": entry.PlayerDeckContent,
+				"remark":              entry.Remark,
+			})
+		} else {
+			// 如果插槽为空，添加 nil
+			sortedDeckEntries = append(sortedDeckEntries, nil)
+		}
+	}
+
+	// 准备返回的数据
+	responseData := map[string]interface{}{
+		"deck_entries": sortedDeckEntries,
+	}
+
+	// 将数据转换为 JSON 格式
+	jsonResponse, err := json.Marshal(responseData)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// 设置响应头和返回数据
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(jsonResponse)
 }
@@ -738,4 +867,291 @@ func handleFunc(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "未知功能", http.StatusBadRequest)
 	}
+}
+
+func monitorFile(fileName string, lineChan chan<- string) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		fmt.Println("无法创建文件监视器:", err)
+		return
+	}
+	defer watcher.Close()
+
+	err = watcher.Add(fileName)
+	if err != nil {
+		fmt.Println("无法监视文件:", err)
+		return
+	}
+
+	file, err := os.Open(fileName)
+	if err != nil {
+		fmt.Println("无法打开文件:", err)
+		return
+	}
+	defer file.Close()
+
+	// 将文件指针移动到文件末尾
+	_, err = file.Seek(0, io.SeekEnd)
+	if err != nil {
+		fmt.Println("无法移动文件指针:", err)
+		return
+	}
+
+	reader := bufio.NewReader(file)
+
+	for {
+		select {
+		case event := <-watcher.Events:
+			if event.Op&fsnotify.Write == fsnotify.Write {
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						if err == io.EOF {
+							break
+						} else {
+							fmt.Println("读取文件出错:", err)
+							return
+						}
+					}
+					line = strings.TrimSpace(line)
+					if line != "" {
+						lineChan <- line
+					}
+				}
+			}
+		case err := <-watcher.Errors:
+			fmt.Println("监视器错误:", err)
+		}
+	}
+}
+
+func processChatLines(lineChan <-chan string) {
+	var processedMessages = make(map[string]bool)
+
+	for line := range lineChan {
+
+		fmt.Print("\n收到新行: ", line)
+		// 解析行内容
+		timestamp, playerID, message, parseErr := parseChatLine(line)
+		if parseErr != nil {
+			fmt.Println("解析聊天行出错:", parseErr)
+			continue
+		}
+
+		// 构建唯一键
+		messageKey := fmt.Sprintf("%s-%s-%s", timestamp, playerID, message)
+		if processedMessages[messageKey] {
+			continue // 已处理过，跳过
+		}
+		processedMessages[messageKey] = true
+
+		// 检查并处理特定命令
+		handleChatCommand(playerID, message)
+	}
+}
+
+func parseChatLine(line string) (timestamp string, playerID string, message string, err error) {
+	// 使用正则表达式匹配行格式
+	re := regexp.MustCompile(`\[(\d+)\]\s+(\d+):\s+(.+)`)
+	matches := re.FindStringSubmatch(line)
+	if matches == nil || len(matches) != 4 {
+		return "", "", "", fmt.Errorf("行格式不正确: %s", line)
+	}
+	timestamp = matches[1]
+	playerID = matches[2]
+	message = matches[3]
+	return timestamp, playerID, message, nil
+}
+
+func handleChatCommand(playerID string, message string) {
+	// 检查是否是 upload 空格 数字 或 card 空格 数字
+	uploadRe := regexp.MustCompile(`^upload\s+(\d+)(?:\s+(.*))?$`)
+	cardRe := regexp.MustCompile(`^card\s+(\d+)$`)
+
+	if matches := uploadRe.FindStringSubmatch(message); matches != nil {
+		number := matches[1]
+		remark := ""
+		if len(matches) == 3 {
+			remark = matches[2]
+		}
+		// 调用处理 upload 命令的函数，并传递备注信息
+		handleUploadCommand(playerID, number, remark)
+	} else if matches := cardRe.FindStringSubmatch(message); matches != nil {
+		number := matches[1]
+		// 调用处理 card 命令的函数
+		handleCardCommand(playerID, number)
+	} else {
+		// 非命令消息，可以根据需要处理
+		fmt.Printf("玩家 %s 发送了消息：%s\n", playerID, message)
+	}
+}
+
+func handleUploadCommand(playerID string, numberStr string, remark string) {
+	// 将数字字符串转换为整数
+	number, err := strconv.Atoi(numberStr)
+	if err != nil || number < 1 || number > 20 {
+		fmt.Printf("玩家 %s 提供的数字无效：%s\n", playerID, numberStr)
+		return
+	}
+
+	// 查找玩家
+	player, exists := players[playerID]
+	if !exists {
+		fmt.Printf("未找到玩家 %s\n", playerID)
+		return
+	}
+
+	// 检查 PlayerDeckContent 是否为空
+	if player.PlayerDeckContent == "" {
+		fmt.Printf("玩家 %s 的 PlayerDeckContent 为空，无法上传\n", playerID)
+		return
+	}
+
+	// 根据 PlayerAlliance 进行槽位映射
+	mappedNumber := number
+	if player.PlayerAlliance == "1" {
+		// 只能存储到11-20槽位，自动转换1-10为11-20
+		if number >= 11 {
+			mappedNumber -= 10
+			fmt.Printf("玩家 %s 的 PlayerAlliance 为1，槽位 %d 自动转换为 %d\n", playerID, number, mappedNumber)
+		}
+	} else if player.PlayerAlliance == "0" {
+		// 只能存储到1-10槽位，自动转换11-20为1-10
+		if number <= 10 {
+			mappedNumber += 10
+			fmt.Printf("玩家 %s 的 PlayerAlliance 为0，槽位 %d 自动转换为 %d\n", playerID, number, mappedNumber)
+		}
+	} else {
+		fmt.Printf("玩家 %s 的 PlayerAlliance 值无效：%d\n", playerID, player.PlayerAlliance)
+		return
+	}
+
+	// 验证转换后的槽位是否在允许范围内
+	if mappedNumber < 1 || mappedNumber > 20 {
+		fmt.Printf("玩家 %s 的槽位 %d 转换后无效：%d\n", playerID, number, mappedNumber)
+		return
+	}
+
+	// 存储 DeckEntry 到数组中
+	deckContents[mappedNumber-1] = DeckEntry{
+		EugNetID:          player.EugNetID,
+		PlayerName:        player.PlayerName,
+		SteamID:           player.SteamID,
+		PlayerDeckContent: player.PlayerDeckContent,
+		Remark:            remark,
+	}
+	fmt.Printf("已存储玩家 %s 的 PlayerDeckContent 到位置 %d\n", playerID, mappedNumber)
+
+	// 构建命令字符串
+	command := fmt.Sprintf("setpvar %s PlayerDeckContent %s", playerID, player.PlayerDeckContent)
+
+	// 发送命令并进行错误处理
+	err = sendMessage(command, sharedConn)
+	if err != nil {
+		fmt.Printf("发送命令时出错：%v\n", err)
+		return
+	}
+	fmt.Println("Message sent successfully!")
+}
+
+func handleCardCommand(playerID string, numberStr string) {
+	// 将数字字符串转换为整数
+	number, err := strconv.Atoi(numberStr)
+	if err != nil || number < 1 || number > 20 {
+		fmt.Printf("玩家 %s 提供的数字无效：%s\n", playerID, numberStr)
+		return
+	}
+
+	// 从数组中获取 DeckEntry
+	deckEntry := deckContents[number-1]
+	if deckEntry.PlayerDeckContent == "" {
+		fmt.Printf("位置 %d 的卡组内容为空，无法执行 card 命令\n", number)
+		return
+	}
+
+	// 查找玩家
+	player, exists := players[playerID]
+	if !exists {
+		fmt.Printf("未找到玩家 %s\n", playerID)
+		return
+	}
+
+	// 对玩家执行操作，例如更新玩家的 PlayerDeckContent
+	player.PlayerDeckContent = deckEntry.PlayerDeckContent
+	fmt.Printf("已将位置 %d 的卡组内容应用到玩家 %s\n", number, playerID)
+	// 构建命令字符串
+	command := fmt.Sprintf("setpvar %s PlayerDeckContent %s", playerID, deckEntry.PlayerDeckContent)
+
+	// 发送命令并进行错误处理
+	err = sendMessage(command, sharedConn)
+	if err != nil {
+		fmt.Printf("发送命令时出错：%v\n", err)
+		return
+	}
+	fmt.Println("Message sent successfully!")
+}
+
+// 使用正则表达式匹配引号包裹的字段
+var entryPattern = regexp.MustCompile(`(\S+)\s+(\d+)\s+"([^"]+)"\s+(\S+)\s+(\S+)\s+"([^"]+)"`)
+
+// 从自定义格式的文件中加载数据
+func loadDeckEntriesFromCustomFile(filePath string) error {
+	// 打开文件
+
+	// 检查文件是否存在
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		fmt.Printf("文件 %s 不存在，跳过文件读取。\n", filePath)
+		return nil // 文件不存在，直接返回，继续程序执行
+	}
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("无法打开文件: %v", err)
+	}
+	defer file.Close()
+
+	// 使用 bufio.Scanner 逐行读取文件
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// 使用正则表达式匹配每一行数据
+		matches := entryPattern.FindStringSubmatch(line)
+		if matches == nil || len(matches) != 7 {
+			fmt.Printf("无效的行格式: %s\n", line)
+			continue
+		}
+
+		// 解析 Index 字段（确定数据存储位置）
+		index, err := strconv.Atoi(matches[2])
+		if err != nil || index < 1 || index > 20 {
+			fmt.Printf("无效的索引: %s\n", matches[2])
+			continue
+		}
+
+		// 提取其他字段
+		eugNetID := matches[1]
+		playerName := matches[3] // 引号内的 PlayerName
+		steamID := matches[4]
+		playerDeckContent := matches[5]
+		remark := matches[6] // 引号内的 Remark
+
+		// 存储到 deckContents 数组（不将 index 存储到结构体中）
+		deckContents[index-1] = DeckEntry{
+			EugNetID:          eugNetID,
+			PlayerName:        playerName,
+			SteamID:           steamID,
+			PlayerDeckContent: playerDeckContent,
+			Remark:            remark,
+		}
+
+		fmt.Printf("存储 DeckEntry 到槽位 %d: %+v\n", index, deckContents[index-1])
+	}
+
+	// 检查扫描过程中的错误
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("扫描文件时出错: %v", err)
+	}
+
+	return nil
 }
